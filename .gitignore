@@ -1,0 +1,8 @@
+bin/
+*.exe
+*.exe.new
+*.exe.old
+*.pdb
+*.suo
+*.user
+.vs/

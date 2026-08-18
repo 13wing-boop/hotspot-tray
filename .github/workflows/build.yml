@@ -1,0 +1,81 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check toolchain on runner
+        shell: pwsh
+        run: |
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          $winmd = "$env:WINDIR\System32\WinMetadata"
+          "csc.exe   : $(Test-Path $csc)"
+          "WinMetadata: $(Test-Path $winmd)"
+          if (Test-Path $winmd) { Get-ChildItem $winmd -Filter 'Windows.*.winmd' | ForEach-Object Name }
+          if (-not (Test-Path $csc)) { throw 'csc.exe not found on runner' }
+          if (-not (Test-Path "$winmd\Windows.Networking.winmd")) { throw 'Windows.Networking.winmd not found on runner' }
+
+      # 태그 빌드에서는 소스의 버전을 태그 값으로 맞춰서, 릴리스 exe 가 항상 태그와 일치하게 한다.
+      - name: Stamp version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME -replace '^v', ''
+          $parts = [System.Collections.ArrayList]@($v.Split('.'))
+          while ($parts.Count -lt 4) { [void]$parts.Add('0') }
+          $asm = ($parts[0..3]) -join '.'
+          "product version = $v"
+          "assembly version = $asm"
+
+          $f = 'src/HotspotTray.cs'
+          $s = Get-Content $f -Raw -Encoding UTF8
+          $s = $s -replace 'AssemblyVersion\("[^"]*"\)',     ('AssemblyVersion("{0}")'     -f $asm)
+          $s = $s -replace 'AssemblyFileVersion\("[^"]*"\)', ('AssemblyFileVersion("{0}")' -f $asm)
+          $s = $s -replace 'public const string Version = "[^"]*";', ('public const string Version = "{0}";' -f $v)
+          Set-Content $f -Value $s -Encoding UTF8 -NoNewline
+
+          if ($s -notmatch [regex]::Escape('public const string Version = "' + $v + '";')) {
+            throw 'version stamping failed'
+          }
+
+      - name: Build
+        shell: cmd
+        run: build.cmd
+
+      - name: Show built file version
+        shell: pwsh
+        run: |
+          $i = Get-Item bin\HotspotTray.exe
+          "size        : $([math]::Round($i.Length/1KB,1)) KB"
+          "fileVersion : $($i.VersionInfo.FileVersion)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HotspotTray
+          path: bin/HotspotTray.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME bin/HotspotTray.exe `
+            --title $env:GITHUB_REF_NAME `
+            --generate-notes
