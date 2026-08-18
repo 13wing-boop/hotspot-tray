@@ -10,13 +10,29 @@
 
 ## 설치 (사용할 PC에서)
 
+PowerShell 창에 이 한 줄이면 끝납니다. 최신 릴리스를 받아 `%LOCALAPPDATA%\Programs\HotspotTray\`에 설치하고,
+로그온 자동 실행까지 등록한 뒤 바로 실행합니다.
+
+```powershell
+irm https://raw.githubusercontent.com/13wing-boop/hotspot-tray/main/install.ps1 | iex
+```
+
+같은 명령을 다시 실행하면 그대로 최신 버전으로 갱신됩니다. 옵션이 필요하면 파일로 받아서:
+
+```powershell
+.\install.ps1 -NoAutoRun -NoStart -Dir "D:\Tools\HotspotTray"
+```
+
+### 수동 설치
+
 1. [Releases](https://github.com/13wing-boop/hotspot-tray/releases/latest)에서 `HotspotTray.exe` 다운로드
 2. **`%LOCALAPPDATA%\Programs\HotspotTray\` 폴더를 만들어 그 안에 두세요.**
    자동 업데이트가 자기 자신을 교체하려면 쓰기 권한이 필요합니다. `C:\Program Files` 아래에 두면 업데이트가 실패합니다.
 3. 실행 → 트레이 아이콘 우클릭 → **"윈도우 시작 시 자동 실행"** 체크
 
-처음 실행할 때 SmartScreen 경고가 뜹니다(코드 서명 인증서가 없어서 정상입니다).
+브라우저로 직접 받으면 첫 실행 때 SmartScreen 경고가 뜹니다(코드 서명 인증서가 없어서 정상입니다).
 `추가 정보` → `실행`을 누르면 되고, 이후에는 안 뜹니다.
+`install.ps1`은 `Unblock-File`로 이 표시를 미리 지우므로 경고가 나오지 않습니다.
 
 ## 트레이 아이콘 상태
 
@@ -66,10 +82,11 @@ git push origin v1.0.1
 2. 현재 버전보다 높으면 트레이 알림 + 메뉴 문구 변경
 3. 설치를 누르면 `HotspotTray.exe`를 `HotspotTray.exe.new`로 내려받음
 4. 실행 중인 exe를 `HotspotTray.exe.old`로 **이름 변경**(윈도우는 실행 중인 exe의 리네임을 허용)
-5. 새 파일을 제자리에 놓고 `/waitfor <pid>`로 재실행 → 이전 프로세스 종료를 기다렸다가 시작
-6. 다음 실행 때 `.old` 파일 삭제
+5. 새 파일을 제자리에 놓고 `/waitfor <pid>`로 재실행 → 이전 프로세스가 완전히 끝나길 기다렸다가(최대 15초) 뮤텍스 획득
+6. 새 인스턴스가 기동하면서 남은 `.old` 파일을 삭제
 
 교체 중 실패하면 `.old`를 되돌려 원래 버전을 유지합니다.
+이 경로는 실제 릴리스 자산으로 전 구간 검증했습니다 — 실행 중 리네임, `/waitfor` 인계, `.old` 정리 모두 정상 동작합니다.
 
 ## 빌드 (개발 PC)
 
@@ -109,6 +126,7 @@ Visual Studio / .NET SDK / NuGet 전부 필요 없습니다. 결과물은 `bin\H
 ```
 src/HotspotTray.cs           전체 소스 (단일 파일)
 build.cmd                    빌드 스크립트
+install.ps1                  다른 PC용 설치/갱신 스크립트
 .github/workflows/build.yml  CI + 태그 푸시 시 릴리스 자동 생성
 bin/HotspotTray.exe          빌드 결과물 (git 추적 안 함)
 ```
