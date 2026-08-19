@@ -14,8 +14,12 @@ PowerShell 창에 이 한 줄이면 끝납니다. 최신 릴리스를 받아 `%L
 로그온 자동 실행까지 등록한 뒤 바로 실행합니다.
 
 ```powershell
-irm https://raw.githubusercontent.com/13wing-boop/hotspot-tray/main/install.ps1 | iex
+irm https://api.github.com/repos/13wing-boop/hotspot-tray/contents/install.ps1 -Headers @{Accept='application/vnd.github.raw'} | iex
 ```
+
+> **`raw.githubusercontent.com`을 쓰지 않는 이유**: 국내 ISP에서 이 호스트로의 연결이 리셋되는 경우가 잦습니다
+> (`기본 연결이 닫혔습니다` 오류). `api.github.com`의 contents API로 같은 파일을 받으면 우회됩니다.
+> 릴리스 자산(`github.com/.../releases/download/...`)과 API는 정상이라 앱의 자동 업데이트는 영향받지 않습니다.
 
 같은 명령을 다시 실행하면 그대로 최신 버전으로 갱신됩니다. 옵션이 필요하면 파일로 받아서:
 

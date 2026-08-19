@@ -13,7 +13,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# 기존 설정을 지우지 않고 TLS 1.2 만 추가 (PowerShell 5.1 기본값 대응)
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch { }
 
 $repo = '13wing-boop/hotspot-tray'
 $ua   = @{ 'User-Agent' = 'HotspotTray-installer' }
