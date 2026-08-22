@@ -20,15 +20,15 @@ using Windows.Networking.NetworkOperators;
 [assembly: AssemblyTitle("HotspotTray")]
 [assembly: AssemblyProduct("HotspotTray")]
 [assembly: AssemblyDescription("윈도우 모바일 핫스팟 트레이 토글")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 namespace HotspotTray
 {
     static class App
     {
         // 릴리스 시 GitHub Actions 가 태그 값으로 덮어씁니다.
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
 
         public const string Owner = "13wing-boop";
         public const string Repo = "hotspot-tray";
@@ -113,14 +113,22 @@ namespace HotspotTray
         readonly System.Windows.Forms.Timer timer;
         readonly Icon icoOn, icoOff, icoBusy, icoErr;
         readonly ToolStripMenuItem miStatus, miToggle, miCopy,
-                                   miAutoRun, miAutoOn, miUpdate, miAutoUpdate, miVersion, miExit;
+                                   miAutoRun, miAutoOn, miKeepOn, miUpdate, miAutoUpdate, miVersion, miExit;
 
         // 백그라운드 스레드와 공유되는 상태
         volatile bool busy;
         volatile Toast pendingToast;
         volatile string availableVersion;   // 새 버전 태그 (없으면 null)
 
+        // 꺼짐 방지: 켜져 있는 동안은 계속 유지 대상으로 본다. 트레이에서 끌 때만 해제된다.
+        volatile bool desiredOn;
+        volatile int recoverResult;         // 재점등 결과: 0 없음, 1 성공, 2 실패
+
         UiState current = UiState.Busy;     // UI 스레드 전용
+        bool idleSuppressed;                // 이번 "켜짐" 구간에서 타임아웃을 껐는지
+        DateTime nextRecoverAt;             // 재시도 백오프
+        int recoverFails;
+        DateTime lastRecoverToast;
 
         public TrayContext(bool noAuto)
         {
@@ -136,6 +144,7 @@ namespace HotspotTray
             miCopy = new ToolStripMenuItem("SSID · 비밀번호 복사", null, OnCopyClick);
             miAutoRun = new ToolStripMenuItem("윈도우 시작 시 자동 실행", null, OnAutoRunClick);
             miAutoOn = new ToolStripMenuItem("시작할 때 핫스팟 자동 켜기", null, OnAutoOnClick);
+            miKeepOn = new ToolStripMenuItem("꺼짐 방지 (내가 끌 때까지 유지)", null, OnKeepOnClick);
             miUpdate = new ToolStripMenuItem("업데이트 확인", null, OnUpdateClick);
             miAutoUpdate = new ToolStripMenuItem("자동 업데이트 확인", null, OnAutoUpdateClick);
             miVersion = new ToolStripMenuItem("HotspotTray v" + App.Version);
@@ -148,7 +157,7 @@ namespace HotspotTray
                 new ToolStripSeparator(),
                 miToggle, miCopy,
                 new ToolStripSeparator(),
-                miAutoRun, miAutoOn,
+                miAutoRun, miAutoOn, miKeepOn,
                 new ToolStripSeparator(),
                 miUpdate, miAutoUpdate, miVersion,
                 new ToolStripSeparator(),
@@ -167,8 +176,13 @@ namespace HotspotTray
             timer.Tick += OnTick;
             timer.Start();
 
+            // 시작하자마자 켤 예정이면 아직 꺼져 있어도 "켬"이 사용자 의도다.
+            // (StartupWorker 가 2분 30초 안에 못 켜면 이후는 감시 스레드가 이어받는다)
+            bool willAutoStart = !noAuto && GetAutoOn();
+            if (willAutoStart) desiredOn = true;
+
             RefreshState();
-            if (!noAuto && GetAutoOn()) Spawn(StartupWorker);
+            if (willAutoStart) Spawn(StartupWorker);
             if (GetAutoUpdate()) Spawn(UpdateLoopWorker);
         }
 
@@ -226,6 +240,21 @@ namespace HotspotTray
             }
         }
 
+        // 연결된 기기가 없으면 윈도우가 약 5분 뒤 핫스팟을 끈다("전원 절약").
+        // 이 타임아웃 자체를 꺼서 근본적으로 막는다. 매니저 인스턴스가 아니라
+        // 시스템 전역 설정이라 정적 메서드이며, 핫스팟을 껐다 켜면 되살아나므로
+        // 켤 때마다 다시 호출한다.
+        static void SetIdleTimeout(bool enabled)
+        {
+            try
+            {
+                if (NetworkOperatorTetheringManager.IsNoConnectionsTimeoutEnabled() == enabled) return;
+                if (enabled) NetworkOperatorTetheringManager.EnableNoConnectionsTimeout();
+                else NetworkOperatorTetheringManager.DisableNoConnectionsTimeout();
+            }
+            catch { }   // 이 API 가 없는 윈도우에서는 감시 스레드가 대신 처리한다
+        }
+
         // ---------- 백그라운드 작업 ----------
 
         static void Spawn(ThreadStart work)
@@ -253,6 +282,8 @@ namespace HotspotTray
                     ShowToast(wasOn ? "핫스팟 끄기 실패" : "핫스팟 켜기 실패",
                               r.Status.ToString() + " " + (r.AdditionalErrorMessage ?? ""),
                               ToolTipIcon.Warning);
+                else if (!wasOn && GetKeepOn())
+                    SetIdleTimeout(false);
             }
             catch (Exception ex) { ShowToast("핫스팟 전환 실패", ex.Message, ToolTipIcon.Warning); }
             finally { busy = false; }
@@ -269,12 +300,20 @@ namespace HotspotTray
                     NetworkOperatorTetheringManager mgr = GetManager(out err);
                     if (mgr != null)
                     {
-                        if (mgr.TetheringOperationalState == TetheringOperationalState.On) return;
+                        bool keep = GetKeepOn();
+                        if (mgr.TetheringOperationalState == TetheringOperationalState.On)
+                        {
+                            if (keep) SetIdleTimeout(false);
+                            return;
+                        }
                         busy = true;
                         try
                         {
                             if (WaitOp(mgr.StartTetheringAsync()).Status == TetheringOperationStatus.Success)
+                            {
+                                if (keep) SetIdleTimeout(false);
                                 return;
+                            }
                         }
                         finally { busy = false; }
                     }
@@ -282,6 +321,33 @@ namespace HotspotTray
                 catch { busy = false; }
                 Thread.Sleep(5000);
             }
+        }
+
+        // 꺼짐 방지: 사용자가 끄지 않았는데 꺼져 있으면 다시 켠다.
+        // 무연결 타임아웃 외의 원인(절전 복귀, 어댑터 재시작, 인터넷 프로필 변경)까지 덮는다.
+        void RecoverWorker()
+        {
+            bool ok = false;
+            try
+            {
+                string err;
+                NetworkOperatorTetheringManager mgr = GetManager(out err);
+                if (mgr != null)
+                {
+                    ok = mgr.TetheringOperationalState != TetheringOperationalState.Off
+                       || WaitOp(mgr.StartTetheringAsync()).Status == TetheringOperationStatus.Success;
+                    if (ok) SetIdleTimeout(false);
+                }
+            }
+            catch { }
+            finally { recoverResult = ok ? 1 : 2; busy = false; }
+        }
+
+        // 꺼짐 방지를 켜고 끌 때 윈도우의 무연결 타임아웃도 반대로 맞춰 준다.
+        // (WinRT 호출이라 UI 스레드를 막지 않도록 배경 스레드에서 실행한다)
+        void IdleTimeoutWorker()
+        {
+            SetIdleTimeout(!GetKeepOn());
         }
 
         void ShowToast(string title, string body, ToolTipIcon icon)
@@ -433,6 +499,31 @@ namespace HotspotTray
                 pendingToast = null;
                 ni.ShowBalloonTip(4000, t.Title, t.Body, t.Icon);
             }
+
+            int rr = recoverResult;
+            if (rr != 0)
+            {
+                recoverResult = 0;
+                if (rr == 1)
+                {
+                    recoverFails = 0;
+                    nextRecoverAt = DateTime.MinValue;
+                    // 계속 실패/성공을 반복할 때 알림이 쏟아지지 않도록 1분에 한 번만 알린다.
+                    if (DateTime.UtcNow - lastRecoverToast > TimeSpan.FromMinutes(1))
+                    {
+                        lastRecoverToast = DateTime.UtcNow;
+                        ni.ShowBalloonTip(3000, "핫스팟을 다시 켰습니다",
+                                          "꺼짐 방지가 켜져 있어 자동으로 복구했습니다", ToolTipIcon.Info);
+                    }
+                }
+                else
+                {
+                    // 인터넷이 없는 등 당장 켤 수 없는 상황이면 간격을 늘려 가며 재시도
+                    if (recoverFails < 100) recoverFails++;
+                    nextRecoverAt = DateTime.UtcNow.AddSeconds(Math.Min(60, 5 * recoverFails));
+                }
+            }
+
             RefreshState();
         }
 
@@ -449,9 +540,13 @@ namespace HotspotTray
             catch { }
             string tail = (ssid.Length > 0) ? " · " + ssid : "";
 
+            bool keep = GetKeepOn();
             TetheringOperationalState st = mgr.TetheringOperationalState;
             if (st == TetheringOperationalState.On)
             {
+                desiredOn = true;               // 켜져 있는 동안은 유지 대상
+                if (keep && !idleSuppressed) { idleSuppressed = true; Spawn(IdleTimeoutWorker); }
+
                 int n = 0;
                 try { n = (int)mgr.ClientCount; }
                 catch { }
@@ -459,6 +554,14 @@ namespace HotspotTray
             }
             else if (st == TetheringOperationalState.Off)
             {
+                idleSuppressed = false;
+                if (desiredOn && keep && DateTime.UtcNow >= nextRecoverAt)
+                {
+                    busy = true;
+                    Apply(UiState.Busy, "다시 켜는 중..." + tail);
+                    Spawn(RecoverWorker);
+                    return;
+                }
                 Apply(UiState.Off, "꺼짐" + tail);
             }
             else
@@ -470,6 +573,10 @@ namespace HotspotTray
         void Toggle()
         {
             if (busy) return;
+            // 트레이에서 끄는 것이 "내가 껐다"의 유일한 신호다. 이때만 감시를 놓는다.
+            desiredOn = (current != UiState.On);
+            recoverFails = 0;
+            nextRecoverAt = DateTime.MinValue;
             busy = true;
             Apply(UiState.Busy, "전환 중...");
             Spawn(ToggleWorker);
@@ -496,6 +603,7 @@ namespace HotspotTray
             miCopy.Enabled = current != UiState.Error;
             miAutoRun.Checked = GetAutoRun();
             miAutoOn.Checked = GetAutoOn();
+            miKeepOn.Checked = GetKeepOn();
             miAutoUpdate.Checked = GetAutoUpdate();
 
             string av = availableVersion;
@@ -541,6 +649,18 @@ namespace HotspotTray
         void OnAutoRunClick(object s, EventArgs e) { SetAutoRun(!GetAutoRun()); }
         void OnAutoOnClick(object s, EventArgs e) { SetAutoOn(!GetAutoOn()); }
         void OnAutoUpdateClick(object s, EventArgs e) { SetAutoUpdate(!GetAutoUpdate()); }
+
+        void OnKeepOnClick(object s, EventArgs e)
+        {
+            bool on = !GetKeepOn();
+            SetKeepOn(on);
+            // 켜면 지금 켜져 있는 상태를 유지 대상으로 삼고, 끄면 감시를 놓는다.
+            desiredOn = on && current == UiState.On;
+            idleSuppressed = false;
+            recoverFails = 0;
+            nextRecoverAt = DateTime.MinValue;
+            Spawn(IdleTimeoutWorker);   // 윈도우의 무연결 타임아웃도 반대로 맞춘다
+        }
 
         void OnExitClick(object s, EventArgs e)
         {
@@ -588,6 +708,8 @@ namespace HotspotTray
         static void SetAutoOn(bool on) { SetFlag("StartHotspotOnLaunch", on); }
         static bool GetAutoUpdate() { return GetFlag("AutoUpdate"); }
         static void SetAutoUpdate(bool on) { SetFlag("AutoUpdate", on); }
+        static bool GetKeepOn() { return GetFlag("KeepHotspotOn"); }
+        static void SetKeepOn(bool on) { SetFlag("KeepHotspotOn", on); }
 
         // ---------- 아이콘 (런타임 생성 - 외부 .ico 파일 불필요) ----------
 
